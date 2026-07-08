@@ -1,0 +1,145 @@
+# ============================================================================
+# CÁLCULO DE ESTOQUES DE CARBONO POR MUNICÍPIO E CLASSE DE USO DO SOLO
+# ============================================================================
+# Este script gera uma tabela Excel com:
+# - Área (ha) de cada classe de uso dentro de cada município
+# - Estoque total (toneladas) para cada compartimento de carbono
+# - Estoque médio (t/ha) para cada compartimento
+#
+# Compartimentos:
+#   carbono_acima (acima do solo)
+#   carbono_abaixo (abaixo do solo)
+#   carbono_solo (solo)
+#   carbono_morta (matéria orgânica morta)
+# ============================================================================
+
+# 1. Instalar pacotes (se necessário) ----------------------------------------
+if (!require(terra)) install.packages("terra")
+if (!require(sf)) install.packages("sf")
+if (!require(exactextractr)) install.packages("exactextractr")
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(tidyr)) install.packages("tidyr")
+if (!require(writexl)) install.packages("writexl")
+
+library(terra)
+library(sf)
+library(exactextractr)
+library(dplyr)
+library(tidyr)
+library(writexl)
+
+# 2. Definir caminho dos arquivos -------------------------------------------
+caminho <- "G:/Drives compartilhados/Baixo Carbono e Resiliência Brasil/Projetos Ativos/Santa Catarina/Vale do Itajaí   BRDE/5- DSE/04 Relatórios/Estatísticas/Dados/Arquivos"
+
+# 3. Carregar shapefile de municípios ---------------------------------------
+municipios_vect <- vect(file.path(caminho, "Limites_Municipais_CIMVI_AMVE_EPSG_31982.shp"))
+municipios <- st_as_sf(municipios_vect)
+
+# Verificar nome da coluna de municípios e ajustar se necessário
+print(names(municipios))
+# ATENÇÃO: Substitua "NM_MUN" pelo nome real da coluna (ex: "NOME", "CD_MUN")
+coluna_municipio <- "NM_MUN"   # ← ALTERE SE FOR DIFERENTE
+
+# 4. Carregar raster de uso do solo -----------------------------------------
+r_uso <- rast(file.path(caminho, "UCT_30m_2024_EPSG_31982.tif"))
+
+# 5. Localizar e carregar rasters de carbono --------------------------------
+# Lista todos os arquivos na pasta que contêm "AMVE_CIMVI_clip_reclass"
+arquivos <- list.files(caminho, pattern = "AMVE_CIMVI_clip_reclass", full.names = TRUE, ignore.case = TRUE)
+
+# Função para encontrar arquivo por palavra-chave
+encontrar <- function(palavra) {
+  arq <- grep(palavra, arquivos, value = TRUE, ignore.case = TRUE)
+  if (length(arq) == 0) stop("Arquivo com '", palavra, "' não encontrado!")
+  return(arq[1])
+}
+
+r_above <- rast(encontrar("above"))
+r_below <- rast(encontrar("below"))
+r_soil  <- rast(encontrar("soil"))
+r_dead  <- rast(encontrar("dead"))
+
+# 6. Alinhar rasters de carbono ao raster de uso do solo --------------------
+r_above_align <- resample(r_above, r_uso, method = "bilinear")
+r_below_align <- resample(r_below, r_uso, method = "bilinear")
+r_soil_align  <- resample(r_soil, r_uso, method = "bilinear")
+r_dead_align  <- resample(r_dead, r_uso, method = "bilinear")
+
+# 7. Empilhar rasters --------------------------------------------------------
+r_stack <- c(r_uso, r_above_align, r_below_align, r_soil_align, r_dead_align)
+names(r_stack) <- c("uso", "carbono_acima", "carbono_abaixo", 
+                    "carbono_solo", "carbono_morta")
+
+# 8. Extrair dados por município --------------------------------------------
+extracao <- exact_extract(
+  x = r_stack,
+  y = municipios,
+  include_cols = coluna_municipio,
+  progress = TRUE
+)
+
+# 9. Processar cada município: agrupar por classe de uso --------------------
+pixel_area_ha <- prod(res(r_uso)) / 10000  # 0,09 ha
+
+processar <- function(df, nome_mun) {
+  df %>%
+    filter(!is.na(uso)) %>%
+    group_by(classe = uso) %>%
+    summarise(
+      area_ha = sum(coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      carbono_acima_tons = sum(carbono_acima * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      carbono_abaixo_tons = sum(carbono_abaixo * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      carbono_solo_tons = sum(carbono_solo * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      carbono_morta_tons = sum(carbono_morta * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      carbono_acima_t_ha = ifelse(area_ha > 0, carbono_acima_tons / area_ha, NA_real_),
+      carbono_abaixo_t_ha = ifelse(area_ha > 0, carbono_abaixo_tons / area_ha, NA_real_),
+      carbono_solo_t_ha = ifelse(area_ha > 0, carbono_solo_tons / area_ha, NA_real_),
+      carbono_morta_t_ha = ifelse(area_ha > 0, carbono_morta_tons / area_ha, NA_real_),
+      municipio = nome_mun
+    )
+}
+
+resultado_lista <- list()
+for (i in 1:nrow(municipios)) {
+  nome <- municipios[[coluna_municipio]][i]
+  resultado_lista[[i]] <- processar(extracao[[i]], nome)
+}
+
+resultado_final <- bind_rows(resultado_lista)
+
+# 10. Completar com todas as combinações município × classe -----------------
+resultado_final <- resultado_final %>%
+  complete(municipio, classe, fill = list(
+    area_ha = 0,
+    carbono_acima_tons = 0,
+    carbono_abaixo_tons = 0,
+    carbono_solo_tons = 0,
+    carbono_morta_tons = 0,
+    carbono_acima_t_ha = NA_real_,
+    carbono_abaixo_t_ha = NA_real_,
+    carbono_solo_t_ha = NA_real_,
+    carbono_morta_t_ha = NA_real_
+  ))
+
+# 11. Selecionar colunas na ordem desejada ----------------------------------
+resultado_final <- resultado_final %>%
+  select(municipio, classe, area_ha,
+         carbono_acima_tons, carbono_acima_t_ha,
+         carbono_abaixo_tons, carbono_abaixo_t_ha,
+         carbono_solo_tons, carbono_solo_t_ha,
+         carbono_morta_tons, carbono_morta_t_ha)
+
+# 12. Exportar para Excel ----------------------------------------------------
+write_xlsx(resultado_final, 
+           file.path(caminho, "carbono_por_municipio_e_classe_uso.xlsx"))
+
+# (Opcional) Uma aba por município
+lista_por_municipio <- split(resultado_final, resultado_final$municipio)
+write_xlsx(lista_por_municipio, 
+           file.path(caminho, "carbono_por_municipio_e_classe_uso_abas.xlsx"))
+
+cat("✅ Tabela de carbono exportada com sucesso!\n")
+cat("Arquivo salvo em:", file.path(caminho, "carbono_por_municipio_e_classe_uso.xlsx"))
