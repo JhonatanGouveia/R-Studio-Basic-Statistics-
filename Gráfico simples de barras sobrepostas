@@ -1,0 +1,78 @@
+# Carregar bibliotecas necessárias
+library(readxl)      # Para ler arquivos Excel
+library(ggplot2)     # Para criar o gráfico
+library(tidyr)       # Para transformar os dados (pivot_longer)
+library(dplyr)  
+library(showtext)    # Para usar fontes do Google
+library(sysfonts)# Para manipulação de dados
+font_add_google("Montserrat", "montserrat")
+showtext_auto()
+
+# 1. Ler o arquivo Excel (ajuste o caminho se necessário)
+
+cat("Selecione o arquivo Excel 'Percentual de deposição de sedimentos por município.xlsx'\n")
+arquivo <- file.choose()
+sheets <- excel_sheets(arquivo)
+print(paste("Sheets disponíveis:", paste(sheets, collapse = ", ")))
+dados <- read_excel(arquivo, sheet = "Dados")
+
+print(names(dados))
+
+
+# Selecionar colunas de percentual
+dados_perc <- dados %>%
+  select(NM_MUN, starts_with("Per_")) %>%
+  mutate(across(starts_with("Per_"), as.numeric))
+# Transformar para formato longo
+dados_long <- dados_perc %>%
+  pivot_longer(
+    cols = starts_with("Per_"),
+    names_to = "Categoria",
+    values_to = "Percentual"
+  ) %>%
+  mutate(
+    Categoria = recode(Categoria,
+                       "Per_MuitoBaixa" = "Muito Baixa",
+                       "Per_Baixa"      = "Baixa",
+                       "Per_Média"      = "Média",
+                       "Per_Alta"       = "Alta",
+                       "Per_MuitoAlta"  = "Muito Alta")
+  ) %>%
+  mutate(Categoria = factor(Categoria,
+                            levels = c("Muito Baixa", "Baixa", "Média", "Alta", "Muito Alta")))
+
+# Paleta de cores
+cores_manuais <- c(
+  "Muito Baixa" = "#F0E2D2",
+  "Baixa"       = "#D08C60",
+  "Média"       = "#B36A4C",
+  "Alta"        = "#7A5B4A",
+  "Muito Alta"  = "#2D2420"
+)
+
+# Gráfico
+grafico <- ggplot(dados_long, family = Montserrat, aes(x = Percentual, y = NM_MUN, fill = Categoria)) +
+  geom_col(position = "stack", width = 0.7) +
+  scale_fill_manual(values = cores_manuais) +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(
+    title = "Percentual de deposição de sedimentos por município",
+    x = "Percentual (%)",
+    y = "Municípios",
+    fill = "Categoria de deposição"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "montserrat"),          # Fonte geral
+    axis.text.y = element_text(size = 10, family = "montserrat"),
+    axis.text.x = element_text(size = 10, family = "montserrat"),
+    axis.title = element_text(face = "bold", family = "montserrat"),
+    legend.text = element_text(family = "montserrat"),
+    legend.title = element_text(family = "montserrat"),
+    plot.title = element_text(hjust = 0.5, face = "bold", family = "montserrat"),
+    legend.position = "bottom"
+  ) +
+  scale_y_discrete(limits = rev(levels(factor(dados_long$NM_MUN))))
+
+
+print(grafico)
