@@ -1,0 +1,413 @@
+# ============================================================================
+# PACOTES NECESSÁRIOS
+# ============================================================================
+# install.packages(c("terra", "sf", "dplyr", "tidyr", "ggplot2", "gridExtra", "showtext"))
+
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(showtext)
+
+# ============================================================================
+# CONFIGURAÇÃO DA FONTE MONTSERRAT
+# ============================================================================
+font_add_google("Montserrat", "montserrat")
+showtext_auto()
+
+# ============================================================================
+# CONFIGURAÇÕES GERAIS
+# ============================================================================
+base_path <- "G:/Drives compartilhados/Baixo Carbono e Resiliência Brasil/Projetos Ativos/Santa Catarina/Vale do Itajaí   BRDE/5- DSE/02 Dados"
+
+uso_path <- file.path(
+  base_path,
+  "Dados abertos",
+  "01_Uso e Cobertura da Terra_MapBiomas",
+  "UCT_30m_2024_EPSG_31982.tif"
+)
+
+municipios_path <- file.path(
+  base_path,
+  "Dados abertos",
+  "00_Bases_Cartograficas",
+  "Limites_Municipais_CIMVI_AMVE_EPSG_31982.shp"
+)
+
+# ============================================================================
+# LEGENDA MAPBIOMAS (COM CLASSE 12 CORRIGIDA)
+# ============================================================================
+legenda_mapbiomas <- c(
+  "1"  = "Floresta",
+  "3"  = "Formação Florestal",
+  "4"  = "Formação Savânica",
+  "5"  = "Mangue",
+  "49" = "Restinga Arborizada",
+  "10" = "Formação Natural não Florestal",
+  "11" = "Campo Alagado",
+  "12" = "Formação Campestre",
+  "32" = "Apicum",
+  "29" = "Afloramento Rochoso",
+  "13" = "Outras Formações não Florestais",
+  "14" = "Agropecuária",
+  "15" = "Pastagem",
+  "18" = "Agricultura",
+  "19" = "Lavoura Temporária",
+  "39" = "Soja",
+  "20" = "Cana",
+  "40" = "Arroz",
+  "41" = "Lavouras Temporárias",
+  "36" = "Lavoura Perene",
+  "46" = "Café",
+  "47" = "Citrus",
+  "48" = "Lavouras Perenes",
+  "9"  = "Silvicultura",
+  "21" = "Mosaico de Usos",
+  "22" = "Praia, Duna e Areal",
+  "23" = "Praia",
+  "24" = "Área Urbanizada",
+  "30" = "Mineração",
+  "25" = "Outras Áreas não Vegetadas",
+  "26" = "Corpo D'água",
+  "33" = "Rio, Lago e Oceano",
+  "31" = "Aquicultura",
+  "27" = "Não Observado"
+)
+
+# ============================================================================
+# 1. CARREGAR DADOS BASE (USO E MUNICÍPIOS)
+# ============================================================================
+message("Carregando raster de uso do solo...")
+if (!file.exists(uso_path)) stop("Arquivo de uso do solo não encontrado!")
+uso_rast <- rast(uso_path)
+
+message("Carregando shapefile de municípios...")
+if (!file.exists(municipios_path)) stop("Shapefile de municípios não encontrado!")
+municipios <- st_read(municipios_path, quiet = TRUE)
+municipios <- st_transform(municipios, crs = crs(uso_rast))
+
+# Detecção da coluna com nome do município
+possiveis_nomes <- c("NM_MUN", "NOME", "MUNICIPIO", "NOME_MUN", "Nome", "Municipio")
+nome_col <- NULL
+for (cand in possiveis_nomes) {
+  if (cand %in% colnames(municipios)) {
+    nome_col <- cand
+    break
+  }
+}
+if (is.null(nome_col)) {
+  municipios$ID_MUN <- as.character(1:nrow(municipios))
+  nome_col <- "ID_MUN"
+  message("Nenhuma coluna de nome encontrada. Usando IDs numéricos.")
+} else {
+  message(paste("Coluna de nome do município identificada:", nome_col))
+}
+
+# ============================================================================
+# FUNÇÃO GENÉRICA PARA PROCESSAR UM GRUPO DE MÉTRICAS
+# ============================================================================
+processar_grupo <- function(grupo_nome, pasta_resultados, metricas_lista, cores_lista, nomes_lista, unidade_eixo) {
+  
+  message(paste("\n===== PROCESSANDO:", grupo_nome, "====="))
+  
+  raster_metrics_dir <- file.path(base_path, "Resultados", pasta_resultados)
+  
+  # Verificar arquivos
+  message("Verificando arquivos de métricas...")
+  metricas_existentes <- list()
+  for (nome in names(metricas_lista)) {
+    caminho <- file.path(raster_metrics_dir, metricas_lista[[nome]])
+    if (file.exists(caminho)) {
+      metricas_existentes[[nome]] <- metricas_lista[[nome]]
+    } else {
+      warning(paste("  Arquivo não encontrado:", caminho, "- Pulando", nome))
+    }
+  }
+  
+  if (length(metricas_existentes) == 0) {
+    stop(paste("Nenhum arquivo de métrica encontrado para", grupo_nome))
+  }
+  
+  metricas <- metricas_existentes
+  cores <- cores_lista[names(metricas)]
+  nomes <- nomes_lista[names(metricas)]
+  
+  # Carregar e redimensionar rasters
+  message("Carregando e redimensionando rasters...")
+  rasters_metricas <- list()
+  for (nome in names(metricas)) {
+    caminho <- file.path(raster_metrics_dir, metricas[[nome]])
+    r <- rast(caminho)
+    r_resampled <- resample(r, uso_rast, method = "bilinear")
+    rasters_metricas[[nome]] <- r_resampled
+    message(paste("  ", nome, "OK"))
+  }
+  
+  camadas <- do.call(c, c(list(uso_rast), rasters_metricas))
+  names(camadas) <- c("uso", names(metricas))
+  
+  # Função para processar um município e retornar o grid
+  processar_municipio <- function(municipio, camadas_rast) {
+    
+    nome_mun <- municipio[[nome_col]]
+    if (is.factor(nome_mun)) nome_mun <- as.character(nome_mun)
+    
+    valores <- terra::extract(camadas_rast, municipio, cells = FALSE)
+    
+    if (nrow(valores) == 0) {
+      return(NULL)
+    }
+    
+    valores <- valores %>% filter(uso > 0)
+    if (nrow(valores) == 0) {
+      return(NULL)
+    }
+    
+    df_medias <- valores %>%
+      group_by(uso) %>%
+      summarise(across(all_of(names(metricas)), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+      filter(if_any(all_of(names(metricas)), ~ !is.na(.)))
+    
+    if (nrow(df_medias) == 0) {
+      return(NULL)
+    }
+    
+    df_medias <- df_medias %>%
+      mutate(
+        classe_nome = ifelse(
+          as.character(uso) %in% names(legenda_mapbiomas),
+          legenda_mapbiomas[as.character(uso)],
+          paste0("Classe ", uso)
+        )
+      ) %>%
+      arrange(classe_nome)
+    
+    df_medias <- df_medias %>%
+      group_by(classe_nome) %>%
+      mutate(
+        classe_nome = if_else(
+          n() > 1,
+          paste0(classe_nome, " (", uso, ")"),
+          classe_nome
+        )
+      ) %>%
+      ungroup()
+    
+    df_medias$classe_nome <- factor(df_medias$classe_nome, levels = unique(df_medias$classe_nome))
+    
+    # Criar gráficos
+    lista_graficos <- list()
+    
+    for (metrica in names(metricas)) {
+      df_plot <- df_medias %>%
+        select(classe_nome, valor = all_of(metrica)) %>%
+        filter(!is.na(valor))
+      
+      if (nrow(df_plot) == 0) next
+      
+      p <- ggplot(df_plot, aes(x = classe_nome, y = valor)) +
+        geom_col(
+          fill = cores[metrica],
+          width = 0.6
+        ) +
+        coord_flip() +
+        geom_text(
+          aes(label = round(valor, 2)),
+          hjust = -0.8,
+          size = 3,
+          family = "montserrat",
+          color = "black"
+        ) +
+        labs(
+          title = nomes[metrica],
+          x = "Classe de uso do solo",
+          y = unidade_eixo
+        ) +
+        theme_minimal(base_size = 10, base_family = "montserrat") +
+        theme(
+          axis.text.y = element_text(size = 8, family = "montserrat", margin = margin(r = 5)),
+          axis.text.x = element_text(size = 8, family = "montserrat", margin = margin(t = 5)),
+          axis.title.x = element_text(size = 9, face = "bold", family = "montserrat", margin = margin(t = 15)),
+          axis.title.y = element_text(size = 9, face = "bold", family = "montserrat", margin = margin(r = 15)),
+          plot.title = element_text(face = "bold", size = 11, hjust = 0.5, family = "montserrat"),
+          panel.grid.major.y = element_blank(),
+          panel.grid.major.x = element_line(color = "gray90", size = 0.3),
+          panel.grid.minor = element_blank(),
+          plot.margin = margin(t = 10, r = 20, b = 10, l = 10)
+        ) +
+        scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+        expand_limits(y = max(df_plot$valor) * 1.5)
+      
+      lista_graficos[[metrica]] <- p
+    }
+    
+    if (length(lista_graficos) == 0) return(NULL)
+    
+    ordem <- names(metricas)
+    lista_ordenada <- lista_graficos[ordem]
+    for (i in seq_along(ordem)) {
+      if (is.null(lista_ordenada[[i]])) {
+        lista_ordenada[[i]] <- ggplot() + 
+          annotate("text", x = 0.5, y = 0.5, label = "Sem dados", size = 8, family = "montserrat") +
+          theme_void() +
+          labs(title = nomes[ordem[i]])
+      }
+    }
+    
+    titulo_geral <- paste("Município de", nome_mun)
+    
+    grid_plot <- grid.arrange(
+      grobs = lista_ordenada,
+      ncol = 1,
+      nrow = length(metricas),
+      top = grid::textGrob(titulo_geral, gp = grid::gpar(fontsize = 14, fontface = "bold", fontfamily = "montserrat"))
+    )
+    
+    return(grid_plot)
+  }
+  
+  # ======== EXPORTAR TODOS OS MUNICÍPIOS ========
+  # Criar pasta de saída para este grupo
+  output_dir <- file.path(base_path, "Resultados", paste0("Graficos_", gsub(" ", "_", grupo_nome)))
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  
+  # Loop por todos os municípios
+  for (i in 1:nrow(municipios)) {
+    mun <- municipios[i, ]
+    nome_mun <- mun[[nome_col]]
+    if (is.factor(nome_mun)) nome_mun <- as.character(nome_mun)
+    
+    message(paste("\n  Município:", nome_mun))
+    
+    grid_plot <- processar_municipio(mun, camadas)
+    
+    if (is.null(grid_plot)) {
+      message("    Sem dados para este município.")
+      next
+    }
+    
+    # Salvar o gráfico
+    nome_arquivo <- gsub("[^A-Za-z0-9_]", "_", nome_mun)
+    caminho_arquivo <- file.path(output_dir, paste0("municipio_", nome_arquivo, ".png"))
+    
+    ggsave(
+      filename = caminho_arquivo,
+      plot = grid_plot,
+      width = 10,
+      height = 2 + 2.5 * length(metricas),  # altura ajustada automaticamente
+      dpi = 300,
+      bg = "white"
+    )
+    
+    message(paste("    Salvo:", caminho_arquivo))
+  }
+  
+  message(paste("\nExportação concluída para", grupo_nome, "- Arquivos em:", output_dir))
+}
+
+# ============================================================================
+# 2. CONFIGURAR CADA GRUPO E EXECUTAR
+# ============================================================================
+
+# --- GRUPO 1: SEDIMENTOS ---
+sedimentos_metricas <- list(
+  perda_solo            = "usle_AMVE_CIMVI_clip_reclass.tif",
+  erosao_evitada        = "avoided_erosion_AMVE_CIMVI_clip_reclass.tif",
+  assoreamento_evitado  = "avoided_export_AMVE_CIMVI_clip_reclass.tif",
+  deposicao_sedimentos  = "sed_deposition_AMVE_CIMVI_clip_reclass.tif"
+)
+
+sedimentos_cores <- c(
+  "perda_solo"            = "#00646C",
+  "erosao_evitada"        = "#9fdde4",
+  "assoreamento_evitado"  = "#ffe144",
+  "deposicao_sedimentos"  = "#afd778"
+)
+
+sedimentos_nomes <- c(
+  "perda_solo"            = "Perda de solo",
+  "erosao_evitada"        = "Erosão evitada",
+  "assoreamento_evitado"  = "Assoreamento evitado",
+  "deposicao_sedimentos"  = "Deposição de sedimentos"
+)
+
+# --- GRUPO 2: ÁGUAS PLUVIAIS ---
+pluvial_metricas <- list(
+  infiltracao    = "percolation_volume_CIMVI_clip.tif",
+  retencao       = "retention_volume_CIMVI_clip.tif",
+  escoamento     = "runoff_volume_CIMVI_clip.tif"
+)
+
+pluvial_cores <- c(
+  "infiltracao"   = "#00646C",
+  "retencao"      = "#9fdde4",
+  "escoamento"    = "#ffe144"
+)
+
+pluvial_nomes <- c(
+  "infiltracao"   = "Infiltração",
+  "retencao"      = "Retenção",
+  "escoamento"    = "Escoamento superficial"
+)
+
+# --- GRUPO 3: CARBONO ---
+carbono_metricas <- list(
+  c_above   = "c_above_AMVE_CIMVI_clip_reclass.tif",
+  c_below   = "c_below_AMVE_CIMVI_clip_reclass.tif",
+  c_soil    = "c_soil_AMVE_CIMVI_clip_reclass.tif",
+  c_dead    = "c_dead_AMVE_CIMVI_clip_reclass.tif"
+)
+
+carbono_cores <- c(
+  "c_above" = "#00646C",
+  "c_below" = "#9fdde4",
+  "c_soil"  = "#ffe144",
+  "c_dead"  = "#afd778"
+)
+
+carbono_nomes <- c(
+  "c_above" = "Carbono acima do solo",
+  "c_below" = "Carbono abaixo do solo",
+  "c_soil"  = "Carbono no solo",
+  "c_dead"  = "Carbono de Matéria Orgânica Morta"
+)
+
+# ============================================================================
+# 3. EXECUTAR OS TRÊS GRUPOS
+# ============================================================================
+options(scipen = 999)
+
+# Sedimentos
+processar_grupo(
+  grupo_nome = "SEDIMENTOS",
+  pasta_resultados = "1. Retenção de Sedimentos",
+  metricas_lista = sedimentos_metricas,
+  cores_lista = sedimentos_cores,
+  nomes_lista = sedimentos_nomes,
+  unidade_eixo = "Valor médio (ton/ha/ano)"
+)
+
+# Águas Pluviais
+processar_grupo(
+  grupo_nome = "ÁGUAS PLUVIAIS",
+  pasta_resultados = "2. Retenção de águas pluviais",
+  metricas_lista = pluvial_metricas,
+  cores_lista = pluvial_cores,
+  nomes_lista = pluvial_nomes,
+  unidade_eixo = "Valor médio (m³)"
+)
+
+# Carbono
+processar_grupo(
+  grupo_nome = "CARBONO",
+  pasta_resultados = "3. Estoque de Carbono",
+  metricas_lista = carbono_metricas,
+  cores_lista = carbono_cores,
+  nomes_lista = carbono_nomes,
+  unidade_eixo = "Valor médio (ton/ha)"   # <--- AJUSTADO PARA "ton/ha"
+)
+
+message("\n=== PROCESSAMENTO E EXPORTAÇÃO CONCLUÍDOS ===")
