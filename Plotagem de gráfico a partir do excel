@@ -1,0 +1,59 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(showtext)
+
+# Selecionar o arquivo interativamente
+caminho <- file.choose()
+dados <- read_excel(caminho, sheet = "estatsticas_zonais")
+
+font_add_google("Montserrat", "montserrat")
+showtext_auto()
+
+# Filtrar municípios (excluir totais)
+dados_municipios <- dados %>%
+  filter(NM_MUN != "Totais" & !is.na(NM_MUN))
+
+# Selecionar colunas de interesse
+dados_plot <- dados_municipios %>%
+  select(NM_MUN, Leve_Per, Leve_Moderada_Per, Moderada_Per,
+         Moderada_Alta_Per, Alta_Per, Muito_Alta_Per)
+
+# Transformar para formato longo
+dados_long <- dados_plot %>%
+  pivot_longer(cols = -NM_MUN,
+               names_to = "Classe",
+               values_to = "Percentual")
+
+# Definir ordem das classes (da mais leve para a mais intensa)
+ordem_classes <- c("Leve_Per", "Leve_Moderada_Per", "Moderada_Per",
+                   "Moderada_Alta_Per", "Alta_Per", "Muito_Alta_Per")
+dados_long$Classe <- factor(dados_long$Classe, levels = ordem_classes)
+
+# Ordenar municípios em ordem alfabética invertida (Z-A) para que "A" fique no topo
+ordem_municipios <- rev(sort(unique(dados_long$NM_MUN)))
+dados_long$NM_MUN <- factor(dados_long$NM_MUN, levels = ordem_municipios)
+
+# Gráfico com barras horizontais
+ggplot(dados_long, aes(y = NM_MUN, x = Percentual, fill = Classe)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Percentual de erosão por município",
+    x = "Percentual (%)",
+    y = "Município"
+  ) +
+  scale_fill_brewer(
+    palette = "Reds",
+    labels = c("Leve", "Leve-Moderada", "Moderada",
+               "Moderada-Alta", "Alta", "Muito Alta")
+  ) +
+  guides(fill = guide_legend(nrow = 1, title = NULL)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    text = element_text(family = "montserrat"),
+    axis.text.y = element_text(size = 10),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
