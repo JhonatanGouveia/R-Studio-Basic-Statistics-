@@ -1,0 +1,136 @@
+# =============================================================================
+# Script: Médias de retenção, infiltração e escoamento por classe e município
+# =============================================================================
+
+library(terra)
+library(sf)
+library(dplyr)
+library(readxl)
+library(writexl)
+
+# 1. Diretórios e arquivos -------------------------------------------------
+dir_base <- "G:/Drives compartilhados/Baixo Carbono e Resiliência Brasil/Projetos Ativos/Santa Catarina/Vale do Itajaí   BRDE/5- DSE/02 Dados"
+
+# Shapefile dos municípios
+shp_file <- file.path(dir_base, 
+                      "Dados abertos/00_Bases_Cartograficas/Limites_Municipais_CIMVI_AMVE_EPSG_31982.shp")
+
+# Raster de uso do solo (MapBiomas)
+raster_uso_file <- file.path(dir_base,
+                             "Dados abertos/01_Uso e Cobertura da Terra_MapBiomas/UCT_30m_2024_EPSG_31982.tif")
+
+# Rasters de serviço (pasta 2. Retenção de águas pluviais)
+dir_servicos <- file.path(dir_base, "Resultados/2. Retenção de águas pluviais")
+raster_retencao_file <- file.path(dir_servicos, "retention_volume_CIMVI_clip.tif")
+raster_infiltracao_file <- file.path(dir_servicos, "percolation_volume_CIMVI_clip.tif")
+raster_escoamento_file <- file.path(dir_servicos, "runoff_volume_CIMVI_clip.tif")
+
+# 2. Leitura dos dados -----------------------------------------------------
+# Shapefile
+municipios <- st_read(shp_file)
+
+# Rasters
+r_uso <- rast(raster_uso_file)
+r_retencao <- rast(raster_retencao_file)
+r_infiltracao <- rast(raster_infiltracao_file)
+r_escoamento <- rast(raster_escoamento_file)
+
+# 3. Alinhar rasters (garantir mesma extensão, resolução e projeção) ------
+# Verificar se a resolução e extensão são iguais; se não, alinhar com o raster de uso
+if (!compareGeom(r_uso, r_retencao, stopOnError = FALSE)) {
+  cat("Alinhando rasters de serviço ao raster de uso...\n")
+  r_retencao <- resample(r_retencao, r_uso, method = "bilinear")
+  r_infiltracao <- resample(r_infiltracao, r_uso, method = "bilinear")
+  r_escoamento <- resample(r_escoamento, r_uso, method = "bilinear")
+}
+
+# Reprojetar shapefile se necessário
+if (st_crs(municipios) != crs(r_uso)) {
+  cat("Reprojetando shapefile para o CRS do raster...\n")
+  municipios <- st_transform(municipios, crs = crs(r_uso))
+}
+
+# 4. Legenda MapBiomas (para nomes das classes) ---------------------------
+legenda <- data.frame(
+  classe = c(3,4,5,9,11,12,13,14,15,18,19,20,21,22,23,24,25,29,30,31,32,33,39,40,41,46,47,48,49,50),
+  nome_classe = c("Floresta Densa","Floresta Aberta","Floresta Estacional","Silvicultura",
+                  "Campo Alagado","Pastagem","Cerrado","Savana","Mosaico Agricultura/Pastagem",
+                  "Agricultura","Cultura Perene","Cultura Semiperene","Área Urbanizada",
+                  "Solo Exposto","Área em Transição","Outras Áreas não Vegetadas",
+                  "Afloramento Rochoso","Nascente","Mineração","Aquicultura",
+                  "Zona Urbana Industrial","Rio/Lago/Oceano","Soja","Cana",
+                  "Outras Lavouras Temporárias","Mangue","Sali","Apicum",
+                  "Não Classificado","Não Observado")
+)
+
+# 5. Função para calcular estatísticas por classe para um município --------
+calc_stats_municipio <- function(municipio_sf, raster_uso, r_retencao, r_infiltracao, r_escoamento) {
+  # Máscara do município
+  mask <- rasterize(municipio_sf, raster_uso, field = 1)
+  
+  # Aplicar máscara a todos os rasters
+  uso_mun <- mask(raster_uso, mask)
+  ret_mun <- mask(r_retencao, mask)
+  inf_mun <- mask(r_infiltracao, mask)
+  esc_mun <- mask(r_escoamento, mask)
+  
+  # Extrair valores como data.frame
+  df <- as.data.frame(c(uso_mun, ret_mun, inf_mun, esc_mun), na.rm = TRUE)
+  names(df) <- c("classe", "retencao", "infiltracao", "escoamento")
+  
+  if (nrow(df) == 0) return(NULL)
+  
+  # Agrupar por classe e calcular médias e área
+  stats <- df %>%
+    group_by(classe) %>%
+    summarise(
+      area_ha = n() * 0.09,  # 30 m resolução -> 0.09 ha/pixel
+      retencao_media = mean(retencao, na.rm = TRUE),
+      infiltracao_media = mean(infiltracao, na.rm = TRUE),
+      escoamento_media = mean(escoamento, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(classe)
+  
+  # Adicionar nome e código do município
+  stats$CD_MUN <- municipio_sf$CD_MUN
+  stats$municipio <- municipio_sf$NM_MUN
+  
+  return(stats)
+}
+
+# 6. Processar todos os municípios -----------------------------------------
+resultados_lista <- list()
+total_municipios <- nrow(municipios)
+
+for (i in 1:total_municipios) {
+  cat(sprintf("Processando: %s (%d/%d)\n", municipios$NM_MUN[i], i, total_municipios))
+  res <- calc_stats_municipio(municipios[i, ], r_uso, r_retencao, r_infiltracao, r_escoamento)
+  if (!is.null(res)) {
+    resultados_lista[[i]] <- res
+  }
+}
+
+# Combinar todos os municípios
+tabela_completa <- bind_rows(resultados_lista)
+
+# 7. Juntar com a legenda e selecionar colunas finais ---------------------
+tabela_final <- tabela_completa %>%
+  left_join(legenda, by = "classe") %>%
+  select(municipio, classe, nome_classe, area_ha, 
+         retencao_media, infiltracao_media, escoamento_media)
+
+# 8. Dividir em abas por município e salvar -------------------------------
+lista_abas <- split(tabela_final, tabela_final$municipio)
+lista_abas <- lista_abas[order(names(lista_abas))]
+lista_abas <- lapply(lista_abas, function(df) df[order(df$classe), ])
+
+# Diretório de saída (mesma pasta dos resultados)
+dir_saida <- file.path(dir_base, "Resultados/4. Dados")
+if (!dir.exists(dir_saida)) dir.create(dir_saida, recursive = TRUE)
+
+arquivo_saida <- file.path(dir_saida, "tabela_municipios_classes_servicos.xlsx")
+write_xlsx(lista_abas, path = arquivo_saida)
+
+message(paste("\nPlanilha salva com sucesso em:", arquivo_saida))
+message("Agora cada classe tem suas próprias médias de retenção, infiltração e escoamento!")
