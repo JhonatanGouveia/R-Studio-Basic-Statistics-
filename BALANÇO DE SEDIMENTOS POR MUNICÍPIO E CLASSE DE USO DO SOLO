@@ -1,0 +1,140 @@
+# ============================================================================
+# BALANÇO DE SEDIMENTOS POR MUNICÍPIO E CLASSE DE USO DO SOLO
+# ============================================================================
+# Este script calcula:
+# - Área (ha) de cada classe de uso do solo dentro de cada município
+# - Perda de solo total (toneladas) e taxa média (t/ha)
+# - Erosão evitada total (toneladas) e taxa média (t/ha)
+# - Assoreamento evitado total (toneladas) e taxa média (t/ha)
+# - Deposição de sedimentos total (toneladas) e taxa média (t/ha)
+#
+# Os resultados são exportados para Excel.
+# ============================================================================
+
+# 0. Instalar pacotes (se necessário) -----------------------------------------
+if (!require(terra)) install.packages("terra")
+if (!require(sf)) install.packages("sf")
+if (!require(exactextractr)) install.packages("exactextractr")
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(tidyr)) install.packages("tidyr")
+if (!require(writexl)) install.packages("writexl")
+
+library(terra)
+library(sf)
+library(exactextractr)
+library(dplyr)
+library(tidyr)
+library(writexl)
+
+# 1. Caminho dos arquivos ----------------------------------------------------
+caminho <- "G:/Drives compartilhados/Baixo Carbono e Resiliência Brasil/Projetos Ativos/Santa Catarina/Vale do Itajaí   BRDE/5- DSE/04 Relatórios/Estatísticas/Dados/Arquivos"
+
+# 2. Carregar shapefile de municípios (usando terra::vect) -------------------
+# Isso contorna problemas com arquivo .shx faltante
+municipios_vect <- vect(file.path(caminho, "Limites_Municipais_CIMVI_AMVE_EPSG_31982.shp"))
+municipios <- st_as_sf(municipios_vect)
+
+# Verificar o nome da coluna que identifica os municípios
+print(names(municipios))
+# ATENÇÃO: Substitua "NM_MUN" pelo nome real da coluna (ex: "NOME", "CD_MUN")
+coluna_municipio <- "NM_MUN"   # ← ALTERE SE NECESSÁRIO
+
+# 3. Carregar rasters --------------------------------------------------------
+r_acima <- rast(file.path(caminho, "c_above_AMVE_CIMVI_clip_reclass"))
+r_perda <- rast(file.path(caminho, "usle_CIMVI_clip.tif"))
+r_erosao <- rast(file.path(caminho, "avoided_erosion_CIMVI_clip.tif"))
+r_assoreamento <- rast(file.path(caminho, "avoided_export_CIMVI_clip.tif"))
+r_deposicao <- rast(file.path(caminho, "sed_deposition_CIMVI_clip.tif"))
+
+# 4. Alinhar todos os rasters ao raster de uso do solo -----------------------
+# (mesma extensão, resolução e origem)
+r_perda_align <- resample(r_perda, r_uso, method = "bilinear")
+r_erosao_align <- resample(r_erosao, r_uso, method = "bilinear")
+r_assoreamento_align <- resample(r_assoreamento, r_uso, method = "bilinear")
+r_deposicao_align <- resample(r_deposicao, r_uso, method = "bilinear")
+
+# 5. Empilhar todos os rasters -----------------------------------------------
+r_stack <- c(r_uso, r_perda_align, r_erosao_align, 
+             r_assoreamento_align, r_deposicao_align)
+names(r_stack) <- c("uso", "perda_solo", "erosao_evitada", 
+                    "assoreamento_evitado", "deposicao_sedimentos")
+
+# 6. Extrair dados para cada município ---------------------------------------
+extracao <- exact_extract(
+  x = r_stack,
+  y = municipios,
+  include_cols = coluna_municipio,
+  progress = TRUE
+)
+
+# 7. Processar cada município: agrupar por classe de uso --------------------
+pixel_area_ha <- prod(res(r_uso)) / 10000  # 0,09 ha (para pixel 30m)
+
+processar_municipio <- function(df, nome_mun) {
+  df %>%
+    filter(!is.na(uso)) %>%  # remove pixels sem classe
+    group_by(classe = uso) %>%
+    summarise(
+      area_ha = sum(coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      perda_solo_tons = sum(perda_solo * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      erosao_evitada_tons = sum(erosao_evitada * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      assoreamento_evitado_tons = sum(assoreamento_evitado * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      deposicao_sedimentos_tons = sum(deposicao_sedimentos * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    # Calcular taxas (t/ha) com proteção contra divisão por zero
+    mutate(
+      perda_solo_t_ha = ifelse(area_ha > 0, perda_solo_tons / area_ha, NA_real_),
+      erosao_evitada_t_ha = ifelse(area_ha > 0, erosao_evitada_tons / area_ha, NA_real_),
+      assoreamento_evitado_t_ha = ifelse(area_ha > 0, assoreamento_evitado_tons / area_ha, NA_real_),
+      deposicao_sedimentos_t_ha = ifelse(area_ha > 0, deposicao_sedimentos_tons / area_ha, NA_real_),
+      municipio = nome_mun
+    )
+}
+
+# Aplicar para todos os municípios
+resultado_lista <- list()
+for (i in 1:nrow(municipios)) {
+  nome <- municipios[[coluna_municipio]][i]
+  resultado_lista[[i]] <- processar_municipio(extracao[[i]], nome)
+}
+
+resultado_final <- bind_rows(resultado_lista)
+
+# 8. Garantir que todas as combinações município × classe apareçam ----------
+# (preenche com área = 0 e totais = 0 para classes ausentes)
+resultado_final <- resultado_final %>%
+  complete(municipio, classe, fill = list(
+    area_ha = 0,
+    perda_solo_tons = 0,
+    erosao_evitada_tons = 0,
+    assoreamento_evitado_tons = 0,
+    deposicao_sedimentos_tons = 0,
+    perda_solo_t_ha = NA_real_,
+    erosao_evitada_t_ha = NA_real_,
+    assoreamento_evitado_t_ha = NA_real_,
+    deposicao_sedimentos_t_ha = NA_real_
+  ))
+
+# 9. Selecionar e ordenar colunas (usando any_of para evitar erros) ---------
+resultado_final <- resultado_final %>%
+  select(any_of(c("municipio", "classe", "area_ha",
+                  "perda_solo_tons", "perda_solo_t_ha",
+                  "erosao_evitada_tons", "erosao_evitada_t_ha",
+                  "assoreamento_evitado_tons", "assoreamento_evitado_t_ha",
+                  "deposicao_sedimentos_tons", "deposicao_sedimentos_t_ha")))
+
+# 10. Visualizar primeiras linhas --------------------------------------------
+print(head(resultado_final, 20))
+
+# 11. Exportar para Excel ----------------------------------------------------
+# Planilha única com todos os dados
+write_xlsx(resultado_final, 
+           file.path(caminho, "balanco_por_municipio_e_classe_uso_completo.xlsx"))
+
+# (Opcional) Uma aba por município
+lista_por_municipio <- split(resultado_final, resultado_final$municipio)
+write_xlsx(lista_por_municipio, 
+           file.path(caminho, "balanco_por_municipio_e_classe_uso_abas.xlsx"))
+
+cat("✅ Processo concluído! Arquivos salvos em:\n", caminho)
