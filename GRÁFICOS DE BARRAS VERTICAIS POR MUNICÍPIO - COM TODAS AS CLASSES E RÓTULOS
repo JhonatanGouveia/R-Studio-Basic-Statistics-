@@ -1,0 +1,148 @@
+# ============================================================================
+# GRÁFICOS DE BARRAS VERTICAIS POR MUNICÍPIO - COM TODAS AS CLASSES E RÓTULOS
+# ============================================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# 1. Carregar a tabela de resultados
+caminho <- "G:/Drives compartilhados/Baixo Carbono e Resiliência Brasil/Projetos Ativos/Santa Catarina/Vale do Itajaí   BRDE/5- DSE/04 Relatórios/Estatísticas/Dados/Arquivos"
+dados <- readxl::read_excel(file.path(caminho, "balanco_por_municipio_e_classe_uso_completo.xlsx"))
+
+# 2. Legenda completa das classes (com todos os códigos e nomes)
+legenda_classes <- tibble(
+  classe = c(3, 49, 12, 11, 9, 15, 21, 41, 39, 40, 24, 25, 30, 31, 33),
+  nome   = c("Formação Florestal", "Formação Savânica", "Formação Campestre",
+             "Campo Alagado", "Silvicultura", "Pastagem", "Mosaico de Usos",
+             "Lavoura Temporária", "Lavoura Perene", "Lavoura Perene",
+             "Área Urbana", "Outras Áreas não Vegetadas", "Mineração",
+             "Aquicultura", "Rios e Lagos")
+) %>%
+  distinct(classe, .keep_all = TRUE)
+
+# 3. Cores fixas para cada classe (incluindo as novas)
+cores_fixas <- c(
+  "Formação Florestal"          = "#2E8B57",   # verde floresta
+  "Formação Savânica"           = "#8FBC8F",   # verde savana
+  "Formação Campestre"          = "#FDBF6F",   # amarelo pasto
+  "Campo Alagado"               = "#6A3D9A",   # roxo
+  "Silvicultura"                = "#66C2A5",   # verde claro
+  "Pastagem"                    = "#FDBF6F",   # amarelo
+  "Mosaico de Usos"             = "#FFD92F",   # amarelo ouro
+  "Lavoura Temporária"          = "#A6D854",   # verde lima
+  "Lavoura Perene"              = "#E78AC3",   # rosa
+  "Área Urbana"                 = "#E41A1C",   # vermelho
+  "Outras Áreas não Vegetadas"  = "#BEBEBE",   # cinza
+  "Mineração"                   = "#A52A2A",   # marrom
+  "Aquicultura"                 = "#1F78B4",   # azul
+  "Rios e Lagos"                = "#1F78B4"    # azul (mesmo da aquicultura? Vou diferenciar)
+)
+# Ajuste: Rios e Lagos pode ser "#56B4E9" (azul claro), Aquicultura "#1F78B4" (azul escuro)
+cores_fixas["Rios e Lagos"] <- "#56B4E9"
+
+# 4. Juntar nomes das classes aos dados e completar com todas as combinações
+dados <- dados %>%
+  left_join(legenda_classes, by = "classe") %>%
+  mutate(nome = ifelse(is.na(nome), paste0("Classe ", classe), nome))
+
+# 5. Criar uma tabela completa com todos os municípios × todas as classes
+#    (para garantir que todas as classes apareçam em todos os municípios)
+municipios <- unique(dados$municipio)
+classes_nomes <- unique(legenda_classes$nome)
+
+# Criar um grid com todas as combinações
+grid_completo <- expand.grid(
+  municipio = municipios,
+  nome = classes_nomes,
+  stringsAsFactors = FALSE
+)
+
+# Juntar com os dados existentes e preencher zeros onde faltar
+# Vamos transformar para formato longo com os indicadores
+dados_completos <- dados %>%
+  select(municipio, nome, area_ha, 
+         perda_solo_tons, perda_solo_t_ha,
+         erosao_evitada_tons, erosao_evitada_t_ha,
+         assoreamento_evitado_tons, assoreamento_evitado_t_ha,
+         deposicao_sedimentos_tons, deposicao_sedimentos_t_ha) %>%
+  right_join(grid_completo, by = c("municipio", "nome")) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), 0, .)))
+
+# 6. Função para gerar gráfico de barras com todas as classes e rótulos
+# Função para gerar gráfico de barras com gradiente de cores
+gerar_barras <- function(dados_mun, indicador, titulo) {
+  coluna_valor <- paste0(indicador, "_t_ha")
+  
+  df <- dados_mun %>%
+    select(nome, valor = .data[[coluna_valor]]) %>%
+    arrange(desc(valor))
+  
+  max_valor <- max(df$valor, na.rm = TRUE)
+  y_lim <- ifelse(max_valor > 0, max_valor * 1.15, 0.1)
+  
+  p <- ggplot(df, aes(x = nome, y = valor, fill = valor)) +  # fill = valor para gradiente
+    geom_col(width = 0.7, color = "white", linewidth = 0.3) +
+    geom_text(aes(label = ifelse(valor > 0, round(valor, 2), "")),
+              vjust = -0.3, size = 3, fontface = "bold") +
+    labs(title = titulo, x = NULL, y = "t/ha") +
+    theme_minimal() +
+    theme(legend.position = "none",  # removemos a legenda para não poluir
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+          axis.title.y = element_text(size = 9),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor = element_blank()) +
+    scale_fill_gradient(low = "#9fdde4", high = "#00646c") +  # gradiente definido
+    scale_y_continuous(limits = c(0, y_lim), expand = expansion(mult = c(0, 0.05)))
+  
+  return(p)
+}
+
+# 7. Função para gerar painel 2x2 com os quatro indicadores
+painel_barras <- function(nome_municipio) {
+  dados_mun <- dados_completos %>% filter(municipio == nome_municipio)
+  
+  if (nrow(dados_mun) == 0) {
+    stop("Município não encontrado na tabela.")
+  }
+  
+  indicadores <- c("perda_solo", "erosao_evitada", "assoreamento_evitado", "deposicao_sedimentos")
+  titulos <- c("Perda de Solo (t/ha)", "Erosão Evitada (t/ha)", 
+               "Assoreamento Evitado (t/ha)", "Deposição de Sedimentos (t/ha)")
+  
+  graficos <- list()
+  for (i in seq_along(indicadores)) {
+    graficos[[i]] <- gerar_barras(dados_mun, indicadores[i], titulos[i])
+  }
+  
+  # Montar painel 2x2
+  painel <- (graficos[[1]] | graficos[[2]]) / 
+    (graficos[[3]] | graficos[[4]]) +
+    plot_annotation(title = nome_municipio,
+                    theme = theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold")))
+  
+  return(painel)
+}
+
+# ============================================================================
+# USO: visualize um município específico
+# ============================================================================
+# Exemplo:
+painel_barras("Apiúna")   # substitua pelo nome desejado
+
+pasta_saida <- file.path(caminho, "graficos_municipios")
+if (!dir.exists(pasta_saida)) dir.create(pasta_saida)
+
+# Loop por todos os municípios
+for (mun in municipios) {
+  # Gerar o painel
+  p <- painel_barras(mun)
+  
+  # Nome do arquivo (substitui caracteres problemáticos)
+  nome_arquivo <- gsub("[^A-Za-z0-9]", "_", mun)
+  caminho_png <- file.path(pasta_saida, paste0(nome_arquivo, ".png"))
+  
+ 
+
