@@ -1,0 +1,273 @@
+# ============================================================================
+# RETENÇÃO DE ÁGUAS PLUVIAIS POR MUNICÍPIO E CLASSE DE USO DO SOLO
+# ============================================================================
+# Indicadores:
+# - retention_volume: retenção de água no solo superficial (m³)
+# - percolation_volume: infiltração (m³)
+# - runoff_volume: escoamento superficial (m³)
+#
+# Resultados:
+# - Tabela Excel: área (ha), volume total (m³), volume médio (m³/ha)
+# - Gráficos horizontais (1 linha, 3 colunas) para cada município
+# ============================================================================
+
+# 0. Instalar pacotes (se necessário) -----------------------------------------
+if (!require(terra)) install.packages("terra")
+if (!require(sf)) install.packages("sf")
+if (!require(exactextractr)) install.packages("exactextractr")
+if (!require(dplyr)) install.packages("dplyr")
+if (!require(tidyr)) install.packages("tidyr")
+if (!require(writexl)) install.packages("writexl")
+if (!require(ggplot2)) install.packages("ggplot2")
+if (!require(patchwork)) install.packages("patchwork")
+
+library(terra)
+library(sf)
+library(exactextractr)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(ggplot2)
+library(patchwork)
+
+# ============================================================================
+# 1. CAMINHO DOS ARQUIVOS
+# ============================================================================
+caminho <- "G:/Drives compartilhados/Baixo Carbono e Resiliência Brasil/Projetos Ativos/Santa Catarina/Vale do Itajaí   BRDE/5- DSE/04 Relatórios/Estatísticas/Dados/Arquivos"
+
+# ============================================================================
+# 2. CARREGAR SHAPEFILE DE MUNICÍPIOS
+# ============================================================================
+municipios_vect <- vect(file.path(caminho, "Limites_Municipais_CIMVI_AMVE_EPSG_31982.shp"))
+municipios <- st_as_sf(municipios_vect)
+
+# Verificar o nome da coluna de municípios
+print(names(municipios))
+# ATENÇÃO: Substitua "NM_MUN" pelo nome real da coluna (ex: "NOME", "CD_MUN")
+coluna_municipio <- "NM_MUN"   # ← ALTERE SE NECESSÁRIO
+
+# ============================================================================
+# 3. LOCALIZAR E CARREGAR RASTERS DE ÁGUA (AUTOMÁTICO)
+# ============================================================================
+# Listar todos os arquivos que contêm "volume_CIMVI_clip"
+arquivos <- list.files(caminho, pattern = "volume_CIMVI_clip", full.names = TRUE, ignore.case = TRUE)
+
+# Função para encontrar arquivo por palavra-chave
+encontrar <- function(palavra) {
+  arq <- grep(palavra, arquivos, value = TRUE, ignore.case = TRUE)
+  if (length(arq) == 0) stop("Arquivo com '", palavra, "' não encontrado!")
+  return(arq[1])
+}
+
+r_retention <- rast(encontrar("retention"))
+r_percolation <- rast(encontrar("percolation"))
+r_runoff <- rast(encontrar("runoff"))
+
+# Carregar raster de uso do solo
+r_uso <- rast(file.path(caminho, "UCT_30m_2024_EPSG_31982.tif"))
+
+# ============================================================================
+# 4. ALINHAR RASTERS DE ÁGUA AO RASTER DE USO
+# ============================================================================
+r_retention_align <- resample(r_retention, r_uso, method = "bilinear")
+r_percolation_align <- resample(r_percolation, r_uso, method = "bilinear")
+r_runoff_align <- resample(r_runoff, r_uso, method = "bilinear")
+
+# ============================================================================
+# 5. EMPILHAR RASTERS
+# ============================================================================
+r_stack <- c(r_uso, r_retention_align, r_percolation_align, r_runoff_align)
+names(r_stack) <- c("uso", "retencao", "infiltracao", "escoamento")
+
+# ============================================================================
+# 6. EXTRAIR DADOS POR MUNICÍPIO
+# ============================================================================
+extracao <- exact_extract(
+  x = r_stack,
+  y = municipios,
+  include_cols = coluna_municipio,
+  progress = TRUE
+)
+
+# ============================================================================
+# 7. PROCESSAR CADA MUNICÍPIO: ÁREA E VOLUMES (m³) E MÉDIA (m³/ha)
+# ============================================================================
+pixel_area_ha <- prod(res(r_uso)) / 10000  # 0,09 ha
+
+processar <- function(df, nome_mun) {
+  df %>%
+    filter(!is.na(uso)) %>%
+    group_by(classe = uso) %>%
+    summarise(
+      area_ha = sum(coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      retencao_m3 = sum(retencao * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      infiltracao_m3 = sum(infiltracao * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      escoamento_m3 = sum(escoamento * coverage_fraction * pixel_area_ha, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      retencao_m3_ha = ifelse(area_ha > 0, retencao_m3 / area_ha, NA_real_),
+      infiltracao_m3_ha = ifelse(area_ha > 0, infiltracao_m3 / area_ha, NA_real_),
+      escoamento_m3_ha = ifelse(area_ha > 0, escoamento_m3 / area_ha, NA_real_),
+      municipio = nome_mun
+    )
+}
+
+resultado_lista <- list()
+for (i in 1:nrow(municipios)) {
+  nome <- municipios[[coluna_municipio]][i]
+  resultado_lista[[i]] <- processar(extracao[[i]], nome)
+}
+
+resultado_final <- bind_rows(resultado_lista)
+
+# ============================================================================
+# 8. COMPLETAR COMBINAÇÕES MUNICÍPIO × CLASSE
+# ============================================================================
+resultado_final <- resultado_final %>%
+  complete(municipio, classe, fill = list(
+    area_ha = 0,
+    retencao_m3 = 0,
+    infiltracao_m3 = 0,
+    escoamento_m3 = 0,
+    retencao_m3_ha = NA_real_,
+    infiltracao_m3_ha = NA_real_,
+    escoamento_m3_ha = NA_real_
+  ))
+
+# ============================================================================
+# 9. SELECIONAR COLUNAS NA ORDEM DESEJADA
+# ============================================================================
+resultado_final <- resultado_final %>%
+  select(municipio, classe, area_ha,
+         retencao_m3, retencao_m3_ha,
+         infiltracao_m3, infiltracao_m3_ha,
+         escoamento_m3, escoamento_m3_ha)
+
+# ============================================================================
+# 10. EXPORTAR TABELAS PARA EXCEL
+# ============================================================================
+write_xlsx(resultado_final, 
+           file.path(caminho, "agua_pluvial_por_municipio_e_classe_uso.xlsx"))
+
+# Uma aba por município
+lista_por_municipio <- split(resultado_final, resultado_final$municipio)
+write_xlsx(lista_por_municipio, 
+           file.path(caminho, "agua_pluvial_por_municipio_e_classe_uso_abas.xlsx"))
+
+cat("✅ Tabelas de água pluvial exportadas com sucesso!\n")
+
+# ============================================================================
+# 11. GRÁFICOS DE BARRAS HORIZONTAIS (1 LINHA, 3 COLUNAS) - COM GRADIENTE
+# ============================================================================
+
+# Legenda completa das classes (fornecida)
+legenda_classes <- tibble(
+  classe = c(3, 49, 12, 11, 9, 15, 21, 41, 39, 40, 24, 25, 30, 31, 33),
+  nome   = c("Formação Florestal", "Formação Savânica", "Formação Campestre",
+             "Campo Alagado", "Silvicultura", "Pastagem", "Mosaico de Usos",
+             "Lavoura Temporária", "Lavoura Perene", "Lavoura Perene",
+             "Área Urbana", "Outras Áreas não Vegetadas", "Mineração",
+             "Aquicultura", "Rios e Lagos")
+) %>%
+  distinct(classe, .keep_all = TRUE)
+
+dados_agua <- resultado_final %>%
+  left_join(legenda_classes, by = "classe") %>%
+  mutate(nome = ifelse(is.na(nome), paste0("Classe ", classe), nome))
+
+# Grid completo (todos municípios × todas as classes)
+municipios <- unique(dados_agua$municipio)
+classes_nomes <- unique(legenda_classes$nome)
+
+grid_completo <- expand.grid(
+  municipio = municipios,
+  nome = classes_nomes,
+  stringsAsFactors = FALSE
+)
+
+dados_completos <- dados_agua %>%
+  select(municipio, nome, area_ha, 
+         retencao_m3, retencao_m3_ha,
+         infiltracao_m3, infiltracao_m3_ha,
+         escoamento_m3, escoamento_m3_ha) %>%
+  right_join(grid_completo, by = c("municipio", "nome")) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), 0, .)))
+
+# Função para gerar gráfico de barras com gradiente
+gerar_barras_agua <- function(dados_mun, indicador, titulo) {
+  coluna_valor <- paste0(indicador, "_m3_ha")  # média em m³/ha
+  
+  df <- dados_mun %>%
+    select(nome, valor = .data[[coluna_valor]]) %>%
+    arrange(desc(valor))
+  
+  max_valor <- max(df$valor, na.rm = TRUE)
+  y_lim <- ifelse(max_valor > 0, max_valor * 1.15, 0.1)
+  
+  p <- ggplot(df, aes(x = nome, y = valor, fill = valor)) +
+    geom_col(width = 0.7, color = "white", linewidth = 0.3) +
+    geom_text(aes(label = ifelse(valor > 0, round(valor, 2), "")),
+              vjust = -0.3, size = 2.8, fontface = "bold") +
+    labs(title = titulo, x = NULL, y = "m³/ha") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 6.5),
+          axis.title.y = element_text(size = 8),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor = element_blank()) +
+    scale_fill_gradient(low = "#9fdde4", high = "#00646c") +
+    scale_y_continuous(limits = c(0, y_lim), expand = expansion(mult = c(0, 0.05)))
+  
+  return(p)
+}
+
+# Função para gerar painel horizontal (1 linha, 3 colunas)
+painel_agua_horizontal <- function(nome_municipio) {
+  dados_mun <- dados_completos %>% filter(municipio == nome_municipio)
+  
+  if (nrow(dados_mun) == 0) {
+    stop("Município não encontrado na tabela.")
+  }
+  
+  indicadores <- c("retencao", "infiltracao", "escoamento")
+  titulos <- c("Retenção no Solo", "Infiltração", "Escoamento Superficial")
+  
+  graficos <- list()
+  for (i in seq_along(indicadores)) {
+    graficos[[i]] <- gerar_barras_agua(dados_mun, indicadores[i], titulos[i])
+  }
+  
+  painel <- (graficos[[1]] | graficos[[2]] | graficos[[3]]) +
+    plot_annotation(title = nome_municipio,
+                    theme = theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))) +
+    plot_layout(ncol = 3)
+  
+  return(painel)
+}
+
+# ============================================================================
+# 12. EXPORTAR GRÁFICOS COMO PNG (UM POR MUNICÍPIO)
+# ============================================================================
+pasta_saida <- file.path(caminho, "graficos_agua_horizontal")
+if (!dir.exists(pasta_saida)) dir.create(pasta_saida)
+
+for (mun in municipios) {
+  p <- painel_agua_horizontal(mun)
+  nome_arquivo <- gsub("[^A-Za-z0-9]", "_", mun)
+  caminho_png <- file.path(pasta_saida, paste0(nome_arquivo, ".png"))
+  
+  ggsave(
+    filename = caminho_png,
+    plot = p,
+    width = 14,   # largura um pouco menor porque são 3 colunas
+    height = 6,
+    dpi = 300,
+    units = "in",
+    bg = "white"
+  )
+  cat("Salvo:", nome_arquivo, "\n")
+}
+
+cat("✅ Todos os gráficos de água pluvial foram salvos em:\n", pasta_saida)
